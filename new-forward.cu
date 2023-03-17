@@ -1,8 +1,9 @@
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
-
-__global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+#define kernel_size 7
+#define max_inputs 4
+__global__ void conv_forward_kernel(float* y, const float* __restrict__ x, const float* __restrict__ k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
 
     /*
@@ -12,8 +13,8 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
     */
 
-    const int H_out = H - K + 1; // TOTAL HEIGHT OF EVERY IMAGE STORED IN Y 
-    const int W_out = W - K + 1; // TOTAL WIDTH OF EVERY IMAGE STORED IN X
+    const int H_out = H - kernel_size + 1; // TOTAL HEIGHT OF EVERY IMAGE STORED IN Y 
+    const int W_out = W - kernel_size + 1; // TOTAL WIDTH OF EVERY IMAGE STORED IN X
 
 // An example use of these macros:
 // float a = y4d(0,0,0,0)
@@ -22,20 +23,14 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
 #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
 #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
-    // current issues:
-    // how do we know what image we are currently looking at?
-    // how do we know what channel in that image we are looking at?
-    // how do we properly test bounds for that image?
-    /*
-    1) CALCULATE ROW, AND COLUMN OF OUTPUT PIXEL
-    2) CALCULATE WHICH image  PIXEL IS ASSOCIATED WITH
-    3) BOUNDS CHECKS ON 1-2
-    4) START FOR LOOPS FOR CONVOLUTION MATRIX
-    5) CALCULATE ROW/COL OF INPUT ASSOCIATED WITH CONV- MATRIX POSITIONING
-    6) BOUNDS CHECKS ON INPUTS (LOOKING FOR HALO ELEMENTS)
-    7) ADD CONVOLUTION TO OUTPUT
-    8(RETURN OUTPUT)
-    */
+
+
+    // POSSIBLE SPEED UPS:
+
+    //1) delete if statement- if no bounds are ever overdrawn no reason to check
+    //2) unroll loops to do 2/3/4 computations at once
+    //3) load convolution kernel into shared memory 
+    //4) store input matrix and kernel matrix in constant memory? 
 
      // each thread calculates a SINGLE output pixel, on a SINGULAR image and channel.
      // X axis corresponds to image
@@ -43,24 +38,42 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
      // z axis corresponds to row and width.
 
      // curr image we are looking at 
-     int currImage = (blockDim.x * blockIdx.x) + threadIdx.x;
+     int currImage = blockIdx.x;
      // curr channel in the image we are looking at
-     int currChannel = (blockDim.y * blockIdx.y) + threadIdx.y;
+     int currChannel = blockIdx.y;
      // z axis refers to BOTH ROW + COLUMN- must seperate the two!
      int currRow = ((blockDim.z * blockIdx.z) + threadIdx.z) / W_out;
      int currColumn = ((blockDim.z * blockIdx.z) + threadIdx.z) % W_out;
 
-     // after getting all of our necessary perameters we do a bounds check:
-     if(currImage < B && currChannel < M && currRow < H_out && currColumn < W_out) {
+     // load global variable into register for quicker access
+     int inputChannels = C;
+     /*
+     //shared tile used for quicker loads from kernel matrix
+     __shared__ float kernelTile[kernel_size][kernel_size][max_inputs];
+     
+     //if row/column correspond to kernel positions, load them into tile
+     if(currRow < kernel_size && currColumn < kernel_size) {
+	     //for loop ensures all input channel kernels are loaded
+	     for(int c = 0 ; c < inputChannels; c++) {
+		     kernelTile[currRow][currColumn][c] = k4d(currChannel, c, currRow, currColumn);
+	     }
+     }
+     // ensure kernel is fully loaded before performing convolution
+     __syncthreads();
+     */
+
+     // after getting all of our necessary perameters we do a bounds check: 
+     //not necessary to check bounds on image, or channel as we are garunteed no overflow in kernel call
+     if(currRow < H_out && currColumn < W_out) {
          // if everything is in bounds proceed to calculate convolution for current output
          y4d(currImage, currChannel, currRow , currColumn) = 0; // zero everything out before calculation!
          // loop over number of input channels
-         for(int c = 0; c < C; c++) {           
+         for(int c = 0; c < inputChannels; c++) {           
      	     // loop over convolution matrix (no need to take into account halos as output is smaller then input)
-             for(int p = 0; p < K; p++) { // p corresponds to height, q to width
-                 for(int q = 0; q < K; q++) {
+             for(int p = 0; p < kernel_size; p++) { // p corresponds to height, q to width
+                 for(int q = 0; q < kernel_size; q++) {
 		     y4d(currImage, currChannel, currRow, currColumn) += 
-		     x4d(currImage, c, currRow +  p, currColumn + q) * k4d(currChannel, c, p, q);
+		     x4d(currImage, c, currRow +  p, currColumn + q) * k4d(currChannel, c, p, q); // kernelTile[p][q][c];
 		 }
 	     }
 	 }
@@ -105,7 +118,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_y, const f
     // }
 
 	// CUDAMALLOC CALLS:               Height of single image * width of single image * number of images * size of float.
-	cudaMalloc((void **) device_y_ptr, (H - K + 1) * (W - K + 1) * M * B * sizeof(float)); // OUTPUT SIZE MAY BE WRONG?
+	cudaMalloc((void **) device_y_ptr, (H - K + 1) * (W - K + 1) * M * B * sizeof(float)); 
 	cudaMalloc((void **) device_x_ptr, B * C * H * W  * sizeof(float)); 
 	cudaMalloc((void **) device_k_ptr, K * K * M * C  * sizeof(float)); // different convolution matrix for every channel!
 
@@ -119,14 +132,17 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_y, const f
 
 __host__ void GPUInterface::conv_forward_gpu(float *device_y, const float *device_x, const float *device_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-    // SPAWN ONE THREAD PER OUTPUT CHANNEL!!!!
-    // ENCODE INFORMATION IN ALL 3 DIMENSIONS
-    // X DIM- WHAT IMAGE WE ARE CURRENTLY EVALUATING
-    // Y DIM - WHAT CHANNEL WE ARE CURRENTLY EVALUATING
-    // Z DIM - WHAT ROW AND COLUMN WE ARE CURRENTLY EVALUATING	
-    dim3 blockDim(8,8,8); 
+    
+// each thread calculates a single output channel pixel
+// each block calculates 64  output pixels on a single channel and a single image
+// grid dimensions:
+// X = what image we are currently operating on
+// Y = what channel we are currently operating on
+// Z = what row and column we are currently operating on	
+
+    dim3 blockDim(1,1,64); 
 //(number of images, number of output channels , rows + columns)
-    dim3 gridDim((B / 8) + 1, (M / 8) + 1, (((H - K + 1) * (W - K + 1)) / 8) + 1);  
+    dim3 gridDim(B, M, (((H - K + 1) * (W - K + 1)) / 64) + 1);  
     conv_forward_kernel<<<gridDim, blockDim>>>(device_y, device_x, device_k, B, M, C, H, W, K);
 }
 
